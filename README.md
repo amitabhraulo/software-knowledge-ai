@@ -293,8 +293,8 @@ cp .env.example .env
 Open `.env` and configure your Groq settings:
 
 ```env
-GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=your_groq_model_here
+GROQ_API_KEY=groq_api_key
+GROQ_MODEL=model_name
 ```
 
 Replace the placeholder values with your actual Groq configuration.
