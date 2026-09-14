@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python build files
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Generated ChromaDB vector database
+vector_db/
+
+# Testing / tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
