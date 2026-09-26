@@ -4,6 +4,30 @@
 
 Software Knowledge AI is a document-based RAG application that transforms software architecture PDFs into a searchable knowledge base.
 
+### Current ingestion behavior
+
+Ingestion now uses recursive splitting measured with the embedding model's
+tokenizer: a target of 240 content tokens with up to 40 tokens of overlap.
+Every chunk is validated against that budget, with room for special tokens
+inside MiniLM's 256-token input limit. Source and page metadata are preserved;
+`token_count` records the content-token count.
+
+Startup runs incremental ingestion each time. Unchanged files are skipped.
+The embedding model, token limit, splitter version, size, and overlap determine
+a configuration ID shared by retrieval and ingestion. Collections are named
+`software_knowledge_base_<id>` and manifests `index_manifest_<id>.json`.
+The first run after this change builds a new collection; the old collection
+and manifest remain on disk. Changing these settings creates another index,
+so the application cannot accidentally reuse vectors from incompatible settings.
+Re-indexing can take time and retained collections consume additional disk space.
+
+These token budgets are initial settings, not a measured optimum for answer
+quality. Changing embedding models also requires reviewing its input limit.
+Deleted PDFs are not yet removed automatically, and document replacement is
+retryable but not transactional: a failed update can leave a partial document
+until ingestion succeeds again. See the ingestion and manifest section below
+for the current processing flow and stored metadata.
+
 Instead of manually searching through multiple technical documents, an engineer can ask a question in natural language. The application retrieves relevant information from the indexed documents and uses an LLM to generate a grounded answer.
 
 ---
@@ -50,63 +74,45 @@ The goal of this project is not just to build a chatbot, but to explore the arch
 
 # High-Level Architecture
 
-```text
-PDF Documents
-      ↓
-PyMuPDF Loader
-      ↓
-Recursive Text Chunking
-      ↓
-HuggingFace Embeddings
-      ↓
-Chroma Vector Database
-      ↓
-LangChain Retriever
-      ↓
-Top-K Relevant Chunks
-      ↓
-Prompt Construction
-      ↓
-Groq LLM
-      ↓
-Grounded Answer
+The application has two flows: preparing the knowledge base and answering questions.
+Both use the same embedding model and configuration-specific Chroma collection.
+
+```mermaid
+flowchart TD
+    subgraph ingestion["1. Prepare the knowledge base"]
+        PDFs["PDFs in documents/ and subfolders"]
+        Check["Check file hashes against the active manifest"]
+        Extract["Extract new or changed PDFs with PyMuPDF"]
+        Split["Recursive chunking: 240 tokens, overlap target 40"]
+        Embed["Generate local MiniLM embeddings"]
+        PDFs --> Check
+        Check -->|"Needs indexing"| Extract
+        Extract --> Split --> Embed
+        Check -->|"Unchanged"| Reuse["Reuse existing indexed content"]
+    end
+
+    DB[("Persistent ChromaDB: text, vectors, metadata")]
+    Embed -->|"Store in batches"| DB
+    Reuse -.-> DB
+
+    subgraph answering["2. Answer a question"]
+        Question["User question"]
+        QueryVector["Embed question with the same MiniLM model"]
+        Search["Semantic search"]
+        Context["Top 5 chunks with source and page metadata"]
+        Prompt["Build prompt with question and retrieved context"]
+        LLM["Groq-hosted LLM"]
+        Answer["Display answer in the terminal"]
+        Question --> QueryVector --> Search
+        Search --> Context --> Prompt --> LLM --> Answer
+    end
+
+    DB -->|"Search stored vectors"| Search
 ```
 
-The architecture has two main flows:
-
-### Document Ingestion
-
-```text
-PDF
- ↓
-Load
- ↓
-Chunk
- ↓
-Generate Embeddings
- ↓
-Store in ChromaDB
-```
-
-### Question Answering
-
-```text
-User Question
-      ↓
-Question Embedding
-      ↓
-Semantic Search
-      ↓
-Relevant Chunks
-      ↓
-Context
-      ↓
-Groq LLM
-      ↓
-Answer
-```
-
-HuggingFace embeddings are used for **semantic retrieval**, while Groq provides the **LLM inference** used to generate the final answer.
+Embeddings run locally; the question and retrieved context are sent to Groq for
+answer generation. The prompt asks the model to use the context and acknowledge
+missing information, but answer correctness and citations are not guaranteed.
 
 ---
 
@@ -128,33 +134,25 @@ HuggingFace embeddings are used for **semantic retrieval**, while Groq provides 
 
 ```text
 software-knowledge-ai/
-│
-├── documents/
-│   └── PDF documents used as the knowledge source
-│
-├── src/
-│   ├── config.py
-│   │
-│   ├── ingest/
-│   │   ├── ingest.py
-│   │   └── enterprise_ingest.py
-│   │
-│   ├── search/
-│   │   └── retriever.py
-│   │
-│   ├── rag/
-│   │   └── rag.py
-│   │
-│   └── llm/
-│       └── groq_llm.py
-│
-├── main.py
-├── .env.example
-├── .gitignore
-├── .python-version
-├── pyproject.toml
-├── uv.lock
-└── README.md
+|-- documents/                  # Source PDFs, including subfolders
+|-- src/
+|   |-- config.py               # Paths, token budgets, index identity
+|   |-- ingest/
+|   |   |-- chunking.py          # Shared token-aware recursive splitting
+|   |   |-- ingest.py            # Basic full-ingestion implementation
+|   |   `-- enterprise_ingest.py # Active incremental ingestion
+|   |-- search/retriever.py
+|   |-- rag/rag.py
+|   |-- llm/groq_llm.py
+|   `-- learning/embeddings_lab.py # Optional standalone learning exercise
+|-- tests/test_ingestion.py
+|-- main.py
+|-- .env.example
+|-- .gitignore
+|-- .python-version
+|-- pyproject.toml
+|-- uv.lock
+`-- README.md
 ```
 
 The following directories/files are generated locally and are intentionally not committed to GitHub:
@@ -332,7 +330,10 @@ Start the application using:
 uv run python main.py
 ```
 
-On the first run, the application builds the knowledge base.
+On the first run for the active configuration, the application builds the knowledge base.
+On every later startup it checks PDF hashes, indexes new or modified files, and skips
+unchanged files. This check runs at startup or when ingestion is explicitly invoked;
+it does not watch the document folder while the question loop is running.
 
 ```text
 PDF Documents
@@ -389,146 +390,173 @@ to stop the application.
 
 ---
 
-# Runtime Flow
+# Startup and Incremental Indexing Flow
 
-```text
-main.py
-   ↓
-Knowledge Base Initialization
-   ↓
-Document Ingestion
-   ↓
-User Question
-   ↓
-Retriever
-   ↓
-Question Embedding
-   ↓
-ChromaDB Similarity Search
-   ↓
-Top-K Relevant Chunks
-   ↓
-Context Builder
-   ↓
-Prompt
-   ↓
-Groq LLM
-   ↓
-Grounded Answer
+`main.py` checks the documents before opening the question loop. The diagram
+shows successful indexing; extraction, validation, or write errors stop the run.
+
+```mermaid
+flowchart TD
+    Start["Run main.py"] --> Config["Select collection and manifest using configuration ID"]
+    Config --> Scan["Find PDFs recursively"]
+    Scan --> More{"More PDFs to check?"}
+    More -->|"Yes"| Hash["Calculate SHA-256 of the next PDF"]
+    Hash --> Match{"Path and file hash match the manifest?"}
+    Match -->|"Yes"| Skip["Skip extraction, chunking, and embedding"]
+    Skip --> More
+    Match -->|"No"| Load["Load PDF, split text, and validate token counts"]
+    Load --> Invalidate["Remove previous manifest entry if present"]
+    Invalidate --> Clear["Clear chunks for this file path, including partial writes"]
+    Clear --> Insert["Embed and insert chunks in batches of 100"]
+    Insert --> Save["Save hash, configuration, count, and timestamp to manifest"]
+    Save --> More
+    More -->|"No"| Ready["Open terminal question loop"]
+    Ready --> Ask["Retrieve context and generate an answer for each question"]
 ```
+
+A new configuration with no existing index gets its own collection and manifest,
+so its PDFs are indexed even when their bytes have not changed. This is a startup
+check, not a continuous file watcher. If no PDFs are present, ingestion returns
+without building an index; the terminal question loop still opens.
 
 ---
 
-# Incremental Document Ingestion
+# Implemented Features
 
-Rebuilding embeddings for every document whenever the application changes would become expensive as the knowledge base grows.
+The application runs one incremental ingestion pipeline through
+`src/ingest/enterprise_ingest.py`, followed by retrieval and answer generation.
 
-The ingestion pipeline therefore evolved incrementally.
+| Feature | What the current code does |
+|---|---|
+| PDF ingestion | Finds PDFs in `documents/` and its subfolders and extracts page text. |
+| Token-aware chunking | Splits recursively with a 240-token budget and a 40-token overlap target, then validates chunk sizes. |
+| Incremental indexing | Compares SHA-256 file hashes with the manifest and skips unchanged files. |
+| Document updates | Validates replacement chunks, clears the affected file's old chunks, and inserts the new ones. |
+| Configuration-specific indexes | Uses separate collections and manifests for different embedding/chunking settings. |
+| Persistent storage | Saves text, metadata, and embeddings in local ChromaDB. |
+| Batch insertion and retries | Inserts 100 chunks per batch and clears partial inserts for a file before retrying. |
+| Semantic retrieval | Retrieves the top five matching chunks using the same embedding model as ingestion. |
+| Context-based answers | Sends retrieved passages to a Groq-hosted LLM with instructions to answer from that context. |
 
-## V1 — Basic Ingestion
-
-The initial implementation:
-
-```text
-Load every PDF
-      ↓
-Chunk every document
-      ↓
-Generate all embeddings
-      ↓
-Store everything in ChromaDB
-```
-
-### Limitations
-
-- Re-indexes all documents
-- Recreates embeddings unnecessarily
-- Becomes inefficient as the document repository grows
+The original basic ingestion helpers remain as learning references; they are not
+separate supported application versions. Use `main.py` for the application or
+`python -m src.ingest.enterprise_ingest` for ingestion alone.
 
 ---
 
-## V2 — Incremental Indexing
+# Current Incremental Ingestion and Manifest
 
-The next version introduced:
+File hashes are stored in `vector_db/index_manifest_<configuration_id>.json`.
+`src/config.py` defines its path as `MANIFEST_FILE`. Each key is a PDF path
+relative to `documents/`, including subfolders when present.
 
-- SHA-256 file hashing
-- Index manifest
-- Incremental document detection
-- Batch insertion
-
-For each document:
-
-```text
-PDF
- ↓
-Calculate Hash
- ↓
-Compare with Manifest
- ↓
-Unchanged?
- ├── Yes → Skip
- └── No  → Index
-```
-
-### Benefits
-
-- Unchanged files are skipped
-- Only new documents require embeddings
-- Faster ingestion for growing document repositories
-
----
-
-## V3 — Modified Document Detection
-
-Incremental ingestion also needs to handle existing documents that have changed.
-
-```text
-Existing PDF
-      ↓
-Calculate Current Hash
-      ↓
-Compare with Previous Hash
-      ↓
-Changed?
- ├── No  → Skip
- └── Yes
-       ↓
-Delete Old Chunks
-       ↓
-Reprocess Document
-       ↓
-Generate New Embeddings
-       ↓
-Update Vector Database
-```
-
-### Benefits
-
-- Prevents duplicate vectors
-- Removes stale document chunks
-- Re-indexes only modified documents
-- Keeps the vector database consistent with the source documents
-
----
-
-# Manifest
-
-The ingestion pipeline maintains an index manifest containing information about processed documents.
-
-Conceptually:
+Example entry (hash, count, and timestamp are illustrative):
 
 ```json
 {
   "architecture.pdf": {
-    "file_hash": "...",
+    "file_hash": "<SHA-256 of the PDF bytes>",
     "source": "architecture.pdf",
     "category": "general",
-    "chunk_count": 100
+    "chunk_count": 100,
+    "index_config": {
+      "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+      "embedding_max_tokens": 256,
+      "splitter": "recursive_embedding_tokens_v1",
+      "chunk_size": 240,
+      "chunk_overlap": 40
+    },
+    "indexed_at": "2026-09-27T10:00:00+00:00"
   }
 }
 ```
 
-The manifest allows the ingestion pipeline to determine whether a document is new, unchanged, or modified.
+Two fingerprints serve different purposes:
+
+| Fingerprint | Purpose |
+|---|---|
+| File hash | Detects changes to a PDF's bytes, including PDF metadata changes. |
+| Configuration ID | Identifies the embedding model, token limit, splitter version, chunk size, and overlap used for an index. |
+
+`get_file_hash()` calculates the current file hash. `load_manifest()` reads saved
+hashes. A matching path and hash causes the loop to skip PDF extraction,
+chunking, embedding generation, and insertion. The file is still read to hash it.
+Existing Chroma records remain available for question answering.
+
+For a new or modified file, the current sequence is:
+
+```text
+Load PDF -> Split and validate chunks
+         -> Invalidate previous manifest entry, if present
+         -> Clear chunks belonging to this file path
+         -> Insert new chunks in batches of 100
+         -> Save successful indexing details
+```
+
+Deleting by file path avoids removing another document that happens to have the
+same content hash. Clearing that path also removes partial inserts on retries.
+`save_manifest()` writes a temporary file and then replaces the JSON manifest.
+File hashes are additionally stored in chunk metadata, but the manifest drives
+the unchanged-file check.
+
+For example:
+
+```text
+Incremental ingestion completed.
+Indexed new/changed files: 0
+Updated files: 0
+Skipped unchanged files: 3
+```
+
+This means three PDFs matched their saved hashes and none needed new embeddings.
+`Updated files` is a subset of `Indexed new/changed files`, not an additional count.
+
+A different configuration selects `software_knowledge_base_<configuration_id>`
+and its matching manifest. A configuration with no existing index is indexed from
+scratch; old collections remain on disk. Retrieval imports the same collection
+name from `src/config.py`.
+
+Use `main.py` or the enterprise ingestion module for normal updates. The basic
+`src.ingest.ingest` and `ingest_documents_v1_simple()` paths reprocess documents
+without maintaining the incremental manifest and can create duplicates.
+
+## Run ingestion and checks
+
+Refresh the index without starting question answering:
+
+```powershell
+uv run python -m src.ingest.enterprise_ingest
+```
+
+Run the five regression tests:
+
+```powershell
+uv run python -m unittest discover -s tests -v
+```
+
+The chunking tests require the MiniLM tokenizer in the local Hugging Face cache;
+a normal ingestion run downloads it if needed. Incremental tests use temporary
+files and an in-memory vector-store substitute. They cover size validation,
+metadata preservation, unchanged-file skipping, identical-file isolation,
+partial-write retries, and a new configuration manifest. They do not measure
+answer quality or exercise a real Chroma/Groq request end to end.
+
+After ingestion, inspect retrieval without calling Groq:
+
+```powershell
+uv run python -m src.search.retriever
+```
+
+To check incremental behavior, start `uv run python main.py`, exit, and start it
+again without changing PDFs or configuration. Expect unchanged files to be skipped.
+
+## Current operational limits
+
+- Deleted PDFs are not removed from the index. Renames index the new path but leave old chunks.
+- Replacement is retryable, not transactional; a failed write can leave partial content until a retry succeeds.
+- Concurrent ingestion is not coordinated with locks; use one ingestion process at a time.
+- A matching manifest entry does not verify that its database chunks are still present.
+- Token-safe chunks do not establish retrieval or answer accuracy; evaluation is still needed.
 
 ---
 

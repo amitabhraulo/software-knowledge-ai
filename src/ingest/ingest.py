@@ -6,7 +6,7 @@ PDF files -> Load pages -> Split into chunks -> Create embeddings -> Store in Ch
 """
 
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from src.ingest.chunking import split_documents
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
@@ -15,8 +15,6 @@ from src.config import (
     VECTOR_DB_DIR,
     COLLECTION_NAME,
     EMBEDDING_MODEL_NAME,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
 )
 
 
@@ -54,24 +52,6 @@ def load_documents():
         all_documents.extend(documents)
 
     return all_documents
-
-def split_documents(documents):
-    """
-    Splits large documents into smaller chunks.
-
-    Why chunking?
-    Large pages are difficult to search accurately.
-    Smaller chunks improve semantic search.
-    """
-
-    # RecursiveCharacterTextSplitter tries to split text intelligently.
-    # It tries paragraphs first, then sentences, then characters.
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-
-    # Split documents into chunks.
-    chunk = splitter.split_documents(documents)
-
-    return chunk
 
 def ingest_documents():
     """

@@ -21,7 +21,7 @@ import json
 from datetime import datetime, timezone
 
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from src.ingest.chunking import split_documents
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
@@ -30,8 +30,7 @@ from src.config import (
     VECTOR_DB_DIR,
     COLLECTION_NAME,
     EMBEDDING_MODEL_NAME,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
+    INDEX_CONFIG,
     MANIFEST_FILE,
     BATCH_SIZE,
 )
@@ -71,8 +70,10 @@ def save_manifest(manifest):
     """
     VECTOR_DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(MANIFEST_FILE, "w", encoding="utf-8") as file:
+    temporary_file = MANIFEST_FILE.with_suffix(".tmp")
+    with open(temporary_file, "w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2)
+    temporary_file.replace(MANIFEST_FILE)
 
 
 def get_pdf_category(pdf_file):
@@ -107,18 +108,6 @@ def load_pdf_documents(pdf_file, file_hash):
     return documents
 
 
-def split_documents(documents):
-    """
-    Splits page documents into smaller chunks.
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-    )
-
-    return splitter.split_documents(documents)
-
-
 def get_vector_store():
     """
     Opens existing ChromaDB vector store or creates it if missing.
@@ -131,25 +120,6 @@ def get_vector_store():
         persist_directory=str(VECTOR_DB_DIR),
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
-    )
-
-
-def delete_chunks_by_file_hash(vector_store, old_file_hash):
-    """
-    Deletes all old chunks for a previous version of a file.
-
-    This prevents stale or duplicate chunks after a PDF is modified.
-    """
-    if not old_file_hash:
-        return
-
-    print(f"Deleting old chunks for file_hash: {old_file_hash[:12]}...")
-
-    # LangChain exposes the underlying Chroma collection here.
-    vector_store._collection.delete(
-        where={
-            "file_hash": old_file_hash
-        }
     )
 
 
@@ -213,13 +183,13 @@ def ingest_documents_incremental():
     - Changed file: delete old chunks, then re-index
     """
     manifest = load_manifest()
-    vector_store = get_vector_store()
-
     pdf_files = list(DOCUMENT_DIR.rglob("*.pdf"))
 
     if not pdf_files:
         print("No PDF files found.")
         return
+
+    vector_store = get_vector_store()
 
     indexed_count = 0
     skipped_count = 0
@@ -236,15 +206,14 @@ def ingest_documents_incremental():
             skipped_count += 1
             continue
 
+        # Parse and validate new chunks before removing an existing document.
+        documents = load_pdf_documents(pdf_file, new_file_hash)
+        chunks = split_documents(documents)
+        if not chunks:
+            raise ValueError(f"No text chunks extracted from {relative_path}; index entry not updated.")
+
         if existing_entry and existing_entry.get("file_hash") != new_file_hash:
             print(f"Detected changed file: {relative_path}")
-
-            old_file_hash = existing_entry.get("file_hash")
-
-            delete_chunks_by_file_hash(
-                vector_store=vector_store,
-                old_file_hash=old_file_hash,
-            )
 
             updated_count += 1
         else:
@@ -252,9 +221,13 @@ def ingest_documents_incremental():
 
         print(f"Indexing file: {relative_path}")
 
-        documents = load_pdf_documents(pdf_file, new_file_hash)
-        chunks = split_documents(documents)
-
+        # Clear this path on retries as well as updates, so a partial failed
+        # batch cannot accumulate duplicates. Do not delete another file that
+        # happens to have identical content (and therefore the same hash).
+        if existing_entry:
+            del manifest[relative_path]
+            save_manifest(manifest)
+        vector_store._collection.delete(where={"file_path": str(pdf_file)})
         add_chunks_in_batches(vector_store, chunks)
 
         manifest[relative_path] = {
@@ -262,6 +235,7 @@ def ingest_documents_incremental():
             "source": pdf_file.name,
             "category": get_pdf_category(pdf_file),
             "chunk_count": len(chunks),
+            "index_config": INDEX_CONFIG,
             "indexed_at": datetime.now(timezone.utc).isoformat(),
         }
 
