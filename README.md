@@ -323,6 +323,10 @@ documents/
 ├── microservices-architecture.pdf
 ├── cloud-architecture.pdf
 └── software-design-guide.pdf
+└── Dot_Net_Interview_Questions.pdf
+└── Clean Code ( PDFDrive.com ).pdf
+└── [Sebastian_Raschka,_Vahid_Mirjalili]_Python_Machin(z-lib.org).pdf
+└── designpatterns.pdf
 ```
 
 These documents become the knowledge source for the RAG application.
