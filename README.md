@@ -4,6 +4,9 @@
 
 Software Knowledge AI is a document-based RAG application that transforms software architecture PDFs into a searchable knowledge base.
 
+**Guides:** [Run and test the application](#5-run-the-application) |
+[Baseline vs. improved: implementation and rationale](docs/rag-modes.md)
+
 ### Current ingestion behavior
 
 Ingestion now uses recursive splitting measured with the embedding model's
@@ -141,11 +144,15 @@ software-knowledge-ai/
 |   |   |-- chunking.py          # Shared token-aware recursive splitting
 |   |   |-- ingest.py            # Basic full-ingestion implementation
 |   |   `-- enterprise_ingest.py # Active incremental ingestion
-|   |-- search/retriever.py
-|   |-- rag/rag.py
+|   |-- search/retriever.py        # Original retriever
+|   |-- search/scored_retriever.py # Shared scored search for selectable modes
+|   |-- rag/rag.py                 # Original answer prompt and API
+|   |-- rag/pipelines.py           # Baseline, improved, comparison reports
 |   |-- llm/groq_llm.py
 |   `-- learning/embeddings_lab.py # Optional standalone learning exercise
+|-- docs/rag-modes.md              # Mode comparison, practices, and evaluation
 |-- tests/test_ingestion.py
+|-- tests/test_pipelines.py
 |-- main.py
 |-- .env.example
 |-- .gitignore
@@ -324,69 +331,144 @@ These documents become the knowledge source for the RAG application.
 
 ## 5. Run the Application
 
-Start the application using:
+Run the commands below from the repository root after `uv sync` and configuring
+`GROQ_API_KEY` and `GROQ_MODEL` in `.env`. These commands work in Git Bash and
+PowerShell. The first ingestion may download the embedding model and tokenizer.
+
+**Add PDFs to `documents/` or its subfolders. No document names are required for
+embedding.** Every application startup scans all PDFs, compares their hashes,
+indexes new or modified files, and skips unchanged files.
+
+To index documents separately, without opening the question loop (optional):
 
 ```bash
-uv run python main.py
+uv run python -m src.ingest.enterprise_ingest
 ```
 
-On the first run for the active configuration, the application builds the knowledge base.
-On every later startup it checks PDF hashes, indexes new or modified files, and skips
-unchanged files. This check runs at startup or when ingestion is explicitly invoked;
-it does not watch the document folder while the question loop is running.
+If you already ran that command, proceed directly to any mode below. Startup
+will check hashes again but will not regenerate embeddings for unchanged PDFs.
+Ingestion checks are not a continuous file watcher; restart or rerun ingestion
+after adding documents while the application is running.
 
-```text
-PDF Documents
-      ↓
-Document Loading
-      ↓
-Chunking
-      ↓
-Embedding Generation
-      ↓
-ChromaDB
-      ↓
-vector_db/
+### Old behavior: baseline mode
+
+```bash
+uv run python main.py --mode baseline
 ```
 
-The `vector_db/` directory is generated locally and is not committed to GitHub.
+Enter a question about your PDFs, read the answer, and type `exit` or `quit`.
+`uv run python main.py` without a mode also selects baseline.
 
-After initialization, the application waits for a question:
+### New behavior: improved mode
 
-```text
-Software Knowledge AI
-LangChain RAG over software architecture PDFs.
-
-Question:
+```bash
+uv run python main.py --mode improved
 ```
 
-You can now ask questions such as:
+Ask the same question. Inspect the answer, source IDs such as `[S1]`, and the
+citation-check message. Optional filters and a distance cutoff are available,
+but neither is enabled by default.
 
-```text
-What is an API Gateway?
+### Compare both with one question
+
+```bash
+uv run python main.py --mode compare --show-context
 ```
 
-or:
+Enter a question once. The application runs baseline and then improved, and
+prints both reports: retrieved candidates, source/page details, distances,
+accepted/rejected chunks, answers, citation status, and timings. `--show-context`
+also prints the complete candidate passages.
 
-```text
-Explain the Saga Pattern.
+For one question followed by automatic exit:
+
+```bash
+uv run python main.py --mode compare --question "What is an API Gateway?" --show-context
 ```
 
-The application retrieves relevant document chunks and sends the retrieved context to the Groq LLM to generate the answer.
+Comparison can make two Groq calls per question. Both modes share the same
+indexed documents, embedding model, collection, and LLM configuration. Switching
+modes alone does not require rebuilding the index.
 
-Type:
+### Optional search controls
 
-```text
-exit
+| Option | Purpose |
+|---|---|
+| `--top-k 3` | Retrieve up to three candidates instead of five in both modes. |
+| `--source "example.pdf"` | Search an exact source filename in improved mode. |
+| `--category general` | Search an exact category in improved mode; root-level PDFs use `general`. |
+| `--max-distance 0.65` | Experimental cutoff: retain candidates at or below this raw distance in improved mode. |
+| `--show-context` | Print full retrieved passages, including rejected candidates. |
+| `--question "..."` | Answer once and exit instead of opening an interactive loop. |
+
+Source/category options restrict **retrieval, not ingestion**. Omit them to search
+all indexed PDFs. In compare mode, filters and cutoff apply only to improved;
+baseline remains unfiltered. Baseline-only mode rejects those options.
+
+`0.65` is an illustrative value, not a calibrated recommendation. The inspected
+collection uses squared L2 distance, where lower is closer. The application
+reads and labels the actual metric; distances are not confidence percentages.
+Start without a cutoff and inspect representative results before selecting one.
+
+## 6. Test the Modes and Ingestion
+
+| Test | Action | What to check |
+|---|---|---|
+| New documents | Add PDFs and run ingestion | New files are indexed; unchanged PDFs are skipped. |
+| Baseline vs. improved | Ask the same answerable question using compare mode | Read the evidence and check whether each answer is supported. |
+| New PDF retrieval | Ask about content specific to a new PDF with `--show-context` | Check whether that PDF's passages appear; retrieval is not guaranteed to find every answer. |
+| Unrelated question | Ask something outside the indexed documents | Check whether the model acknowledges missing evidence; without a cutoff, unrelated chunks can still be retrieved. |
+| Unchanged files | Run ingestion again without edits | Expect zero new/changed files and existing files skipped. |
+| Empty search scope | Run the command below with a nonexistent source | Expect no accepted chunks and `LLM called: False`. |
+
+```bash
+uv run python main.py --mode improved --source "nonexistent-document.pdf" --question "What is an API Gateway?"
 ```
 
-or:
+This source filter is just a test of empty-evidence handling, not a required step
+for normal use. Inspect retrieval alone after indexing, without calling Groq:
 
-```text
-quit
+```bash
+uv run python -m src.search.retriever
 ```
 
-to stop the application.
+Run the automated regression suite:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+The current suite contains 13 tests. Ingestion tests require the MiniLM tokenizer
+in the local cache; normal ingestion downloads it when needed. Pipeline tests
+simulate model replies and do not call Groq. Passing tests verify implementation
+behavior, not the factual quality of answers about your PDFs.
+
+For available options:
+
+```bash
+uv run python main.py --help
+```
+
+---
+
+# Baseline vs. Improved RAG
+
+| Behavior | Baseline | Improved |
+|---|---|---|
+| Original prompt | Preserved | Separate system instructions and evidence |
+| Top-k retrieval | Unfiltered | Optional source/category filters and distance cutoff |
+| Empty evidence | Original LLM-call behavior | Returns a message without calling the LLM |
+| Source citations | Not required | Requests `[S#]` citations and checks source-ID ranges |
+| Reports | Scored retrieval and timings | Also shows rejection and citation diagnostics |
+
+Both are maintained runnable behaviors, not historical release labels. The
+baseline CLI now includes diagnostics while preserving its original retrieval
+policy and answer prompt. The improved label identifies added controls; it does
+not claim experimentally proven answer-quality gains.
+
+Read [Baseline and Improved RAG: design, code map, and best practices](docs/rag-modes.md)
+for the complete comparison, implementation locations, rationale, known limits,
+and a staged evaluation plan.
 
 ---
 
@@ -417,7 +499,8 @@ flowchart TD
 A new configuration with no existing index gets its own collection and manifest,
 so its PDFs are indexed even when their bytes have not changed. This is a startup
 check, not a continuous file watcher. If no PDFs are present, ingestion returns
-without building an index; the terminal question loop still opens.
+without building an index. The CLI then requires the active collection to exist; a fresh empty workspace cannot
+open search until documents have been indexed.
 
 ---
 
@@ -435,7 +518,9 @@ The application runs one incremental ingestion pipeline through
 | Configuration-specific indexes | Uses separate collections and manifests for different embedding/chunking settings. |
 | Persistent storage | Saves text, metadata, and embeddings in local ChromaDB. |
 | Batch insertion and retries | Inserts 100 chunks per batch and clears partial inserts for a file before retrying. |
-| Semantic retrieval | Retrieves the top five matching chunks using the same embedding model as ingestion. |
+| Semantic retrieval | Retrieves up to five chunks by default; selectable modes expose actual collection distances. |
+| Improved RAG | Adds optional exact metadata filters, a configurable distance cutoff, an empty-evidence fallback, and source-ID citation checks. |
+| Comparison mode | Runs the same question through baseline and improved pipelines and prints evidence, settings, answers, and timings. |
 | Context-based answers | Sends retrieved passages to a Groq-hosted LLM with instructions to answer from that context. |
 
 The original basic ingestion helpers remain as learning references; they are not
@@ -528,7 +613,7 @@ Refresh the index without starting question answering:
 uv run python -m src.ingest.enterprise_ingest
 ```
 
-Run the five regression tests:
+Run the regression tests:
 
 ```powershell
 uv run python -m unittest discover -s tests -v
@@ -539,7 +624,9 @@ a normal ingestion run downloads it if needed. Incremental tests use temporary
 files and an in-memory vector-store substitute. They cover size validation,
 metadata preservation, unchanged-file skipping, identical-file isolation,
 partial-write retries, and a new configuration manifest. They do not measure
-answer quality or exercise a real Chroma/Groq request end to end.
+answer quality or exercise a real Chroma/Groq request end to end. Pipeline tests
+use a simulated store and chat model to check filtering arguments, cutoff direction,
+empty-evidence behavior, original versus improved prompts, and citation diagnostics.
 
 After ingestion, inspect retrieval without calling Groq:
 
@@ -718,8 +805,8 @@ __pycache__/
 
 Planned improvements include:
 
-- Source citations in generated answers
-- Metadata filtering
+- Claim-level citation support evaluation (source-ID checks are implemented)
+- Authenticated document permissions (source/category search filters are implemented)
 - Hybrid search
 - Cross-encoder reranking
 - Improved chunking strategies

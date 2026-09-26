@@ -46,7 +46,11 @@ def ask_question(question):
     # Retrieve relevant chunks for the question.
     docs = retriever.invoke(question)
 
-     # Convert retrieved chunks into one context string.
+    return generate_baseline_answer(question, docs)
+
+
+def generate_baseline_answer(question, docs, llm=None):
+    """Original prompt and generation, shared with comparison mode."""
     context = format_docs(docs)
     
     # Prompt template keeps question and context separate.
@@ -67,7 +71,8 @@ def ask_question(question):
     )
 
     # Create Groq LLM.
-    llm = get_llm()
+    if llm is None:
+        llm = get_llm()
 
      # LCEL chain: prompt output goes into LLM.
     chain = prompt | llm
